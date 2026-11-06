@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>R28E7Z5XDS.com.octopuscards.octopus</string>
+		<string>R28E7Z5XDS.com.octopuscards.oepay</string>
+		<string>R28E7Z5XDS.com.octopuscards.merchant</string>
+		<string>R28E7Z5XDS.com.octopuscards.octopus.issuer-provisioning</string>
+		<string>R28E7Z5XDS.com.octopuscards.octopus.issuer-provisioning-auth</string>
+	</array>
+	<key>com.apple.developer.team-identifier</key>
+	<string>R28E7Z5XDS</string>
+	<key>application-identifier</key>
+	<string>R28E7Z5XDS.com.octopuscards.octopus</string>
+	<key>com.apple.developer.payment-pass-provisioning</key>
+	<true/>
+	<key>com.apple.developer.nfc.readersession.formats</key>
+	<array>
+		<string>TAG</string>
+	</array>
+	<key>aps-environment</key>
+	<string>production</string>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.octopuscards.octopus</string>
+	</array>
+	<key>com.apple.developer.in-app-payments</key>
+	<array>
+		<string>merchant.com.octopuscards.octopus</string>
+		<string>merchant.com.octopuscards.octopus.dev</string>
+	</array>
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:app.octopus.com.hk</string>
+		<string>applinks:apptesting.octopus.com.hk</string>
+	</array>
+	<key>com.apple.developer.pass-type-identifiers</key>
+	<array>
+		<string>R28E7Z5XDS.*</string>
+	</array>
+</dict>
+</plist>

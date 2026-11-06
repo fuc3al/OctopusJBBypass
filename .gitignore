@@ -1,0 +1,27 @@
+# 构建产物
+build/
+*.dylib
+*.o
+
+# 目标 App 的任何二进制 / 包体
+*.ipa
+*.app/
+*.bin
+*.decrypted
+
+# 设备侧数据：崩溃报告、日志、偏好、keychain 导出
+*.ips
+*.log
+syslog_*.txt
+*.plist.bak
+prefs.plist
+group*.plist
+
+# 本地环境
+.env
+*.local
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

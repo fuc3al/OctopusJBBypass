@@ -1,0 +1,9 @@
+Package: com.octojb.bypass
+Name: OctopusJBHook
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Runtime bypass for Octopus 9.50.0 jailbreak detection (DTT + JailbreakCheck + Promon SHIELD)
+Maintainer: lab
+Author: lab
+Section: Tweaks
+Depends: mobilesubstrate
