@@ -1,65 +1,56 @@
-# 05 · 工具与方法：怎么做这类分析
+# 分析工具
 
-## 静态侧
+## 静态分析
 
-脱壳样本（`cryptid=0`）之后做三件事：
+主要处理 Mach-O、ObjC 元数据和调用点：
 
-1. **Mach-O 解析**：自己写 chained-fixups 解码，得到 section 表、导入符号、`__objc_classrefs` 绑定。
-   （App Store 包符号表完整；第三方脱壳工具有时会抹掉 `LC_SYMTAB` 的字符串表，
-   这时要靠 chained fixups 里的 bind 名还原导入表。）
-2. **ObjC 元数据遍历**：`__objc_classlist` → `class_ro_t`（+24 是类名，+32 是方法列表），
-   注意 **relative / small method list**：`entsizeAndFlags` 最高位为 1 时 entsize=12，
-   三个 int32 都是相对偏移（nameOffset → selref 槽、typesOffset、impOffset）。
-   踩过这个坑的人不少：按大列表解析会得到一堆垃圾方法名。
-3. **交叉引用**：ADRP+ADD/LDR 扫描找字面量与 selref / classref 槽的引用，
-   再用 Capstone 反汇编窗口，把 `__stubs` / `__objc_stubs` 的调用点还原成符号名。
+1. 解析 chained fixups，读取 section、导入符号和 `__objc_classrefs` 绑定。样本缺少 `LC_SYMTAB` 字符串表时，可从 fixups 的 bind 名称补充导入信息。
+2. 从 `__objc_classlist` 遍历到 `class_ro_t`，读取类名和方法列表。64 位布局中，类名和方法列表分别位于 `+24`、`+32`。
+3. 处理 relative / small method list。`entsizeAndFlags` 最高位为 1 时，每项为三个 int32 相对偏移，不能按普通方法列表解析。
+4. 查找 ADRP+ADD/LDR 对字面量、selref、classref 的引用，用 Capstone 反汇编调用点，并关联 `__stubs`、`__objc_stubs` 中的符号。
 
-## 动态侧
+## 运行观测
 
-| 目的 | 手段 |
+| 内容 | 方法 |
 |---|---|
-| 看时序、看谁在什么时候做了什么 | `pymobiledevice3 syslog live --udid …` 或设备上 `/usr/bin/log stream` |
-| 看请求与 body | hook `NSURLSession -dataTaskWithRequest:completionHandler:` / `-uploadTaskWithRequest:fromData:` |
-| 看加密入参 | 符号槽重绑定 `CCCrypt` / `SecKeyCreateEncryptedData` … |
-| 看 keychain | 进程内 `SecItemCopyMatching`（只能看 App 自己那组） |
-| 强制重新登录 | 摘掉 App Group 偏好里的 `AuthenticationManager.session*`，再 `killall cfprefsd` |
-| 拉崩溃报告 | `tools/dev_crashlog.py --pull` |
+| 启动时序 | `pymobiledevice3 syslog live --udid <UDID>` 或设备上的 `/usr/bin/log stream` |
+| 请求 URL 和 body | hook `NSURLSession` 的请求方法 |
+| C 层加密调用 | 重绑定 `CCCrypt`、`SecKeyCreateEncryptedData` 等符号 |
+| keychain 条目 | 进程内调用 `SecItemCopyMatching` |
+| 崩溃报告 | `python tools/dev_crashlog.py --pull <目录>` |
 
-> `log` 是 zsh 的内建命令，直接敲会被 shell 吃掉，要用 **`/usr/bin/log`**。
+设备上查看日志时使用完整路径 `/usr/bin/log`，避免与 shell 内建命令重名。
 
-## 钩子选型（这段是踩坑总结）
+## Hook 方式
 
-| 需求 | 手段 | 适用 |
-|---|---|---|
-| 改 ObjC 方法 | `method_setImplementation` | 任何注入方式 |
-| 拦 C 函数（启动期镜像内） | `DYLD_INTERPOSE` | `LC_LOAD_DYLIB` 注入 |
-| 拦 C 函数（运行期 dlopen 注入） | **符号槽重绑定** | ellekit / 任何后加载场景 |
-| 拦非导出 / 纯 Swift 函数 | inline hook（不改，成本高） | 最后手段 |
+| 目标 | 项目中使用的方式 |
+|---|---|
+| ObjC 方法 | `method_setImplementation` |
+| 启动时加载镜像中的 C 函数 | `DYLD_INTERPOSE` |
+| ellekit 运行时加载后的 C 函数 | 符号槽重绑定 |
+| 非导出 Swift 函数 | 尚未实现 |
 
-### 符号槽重绑定最小实现
+### 符号槽重绑定
 
-遍历 `_dyld_image_count()`，对每个镜像取 slide，扫描 `__DATA*` 段里
-`S_NON_LAZY_SYMBOL_POINTERS` / `S_LAZY_SYMBOL_POINTERS` 的 section，
-把等于 `dlsym(RTLD_DEFAULT, name)` 的槽改成自己的函数：
+[SymbolRebind.m](../src/SymbolRebind.m) 遍历已加载镜像，扫描 `__DATA*` 段中的 `S_NON_LAZY_SYMBOL_POINTERS` 和 `S_LAZY_SYMBOL_POINTERS`。
+找到指向目标函数的槽后，将其替换为 hook 函数：
 
 ```c
-void **slots = (void **)(uintptr_t)(s->addr + (uintptr_t)slide);   // ← slide 千万别忘
+void **slots = (void **)(uintptr_t)(s->addr + (uintptr_t)slide);
 if (slots[j] == target) {
     mprotect(page, getpagesize(), PROT_READ | PROT_WRITE);
     slots[j] = replacement;
 }
 ```
 
-两个必须注意的点：
+这里有两个需要处理的细节：
 
-- **ASLR slide**：`s->addr` 是链接期地址，直接用会读到未映射内存（第一版就这么崩的）。
-- **延迟绑定**：`S_LAZY_SYMBOL_POINTERS` 的槽在首次调用前存的是 stub 地址，
-  不等于是目标的真实地址，会漏补；所以除了启动时补一遍，还要**定时重补**几轮
-  （`src/SymbolRebind.m` 里是每秒一次 × 25 轮）。
+- `s->addr` 是链接时地址，访问前需要加上 ASLR slide。
+- 延迟绑定的槽在首次调用前可能仍指向 stub。当前实现每秒重新扫描一次，共 25 轮。
 
-### 自检
+### 检查是否命中
 
-任何 hook 框架写完，先用一个**必然会被调用**的函数验证机制：
+使用启动时会调用的 `getenv` 检查重绑定，并限制日志数量：
 
 ```c
 static const char *my_getenv(const char *name) {
@@ -69,22 +60,18 @@ static const char *my_getenv(const char *name) {
 }
 ```
 
-`getenv` 在启动阶段会被打几百次，看到命中就说明整套机制通了；
-看不到就说明 interpose/重绑定压根没生效，先别怀疑业务路径。
+若 `getenv` 已命中而加密函数没有调用记录，再检查目标是否经过对应的加密入口。
 
-## 观测代码的写法约定
+`PromonKiller.m` 的日志由 `PROMON_KILLER_DEBUG` 控制；其他观测源码需查看各自的日志宏。
 
-- 每个 hook 都 `@try/@catch` 包住日志逻辑，**绝不让观测代码把目标进程搞崩**。
-- 日志前缀统一（`[PromonKiller]` / `[SymRebind]` / `[NetProbe]`），方便 `log stream --predicate` 过滤。
-- 观测 dylib 与绕过 dylib 分开：观测版带 `-DEBUG` 宏，正式版不 `NSLog`。
-- 不要在一个 App 上同时装两个 tweak —— 实测 ellekit 在这种情况下**一个都不注入**。
+## 工具索引
 
-## 目录对照
-
-```
-src/OctopusJBHook.m     v1/v2 全量绕过（含 interpose 版文件钩子，作参考）
-src/PromonKiller.m      最小绕过（生产用）
-src/PromonNetProbe.m    ObjC 网络观测
-src/PromonCryptoScan.m  interpose 版加密观测（在 ellekit 下无效，作反面对照）
-src/SymbolRebind.m      符号槽重绑定 + 自检 + AES/RSA/keychain 观测 + 网络日志
-```
+| 文件 | 用途 |
+|---|---|
+| [devssh.py](../tools/devssh.py) | SSH 命令和 SFTP 文件传输，使用 `IPHONE_HOST`、`IPHONE_USER`、`IPHONE_PASS` |
+| [deploy_tweak.py](../tools/deploy_tweak.py) | 安装、卸载 tweak，启动 App 和清理会话偏好 |
+| [dev_crashlog.py](../tools/dev_crashlog.py) | 拉取和整理崩溃报告，设备选择使用 `IPHONE_SERIAL` |
+| [verify_ipa_signature.py](../tools/verify_ipa_signature.py) | 检查 CodeDirectory 摘要和加载库路径 |
+| [inject_dylib.py](../tools/inject_dylib.py) | 向 Mach-O 添加 `LC_LOAD_DYLIB` |
+| [patch_binary.py](../tools/patch_binary.py) | 修改检测方法的返回值 |
+| [verify_hooks.js](../tools/verify_hooks.js) | 通过 Frida 检查 hook 结果 |

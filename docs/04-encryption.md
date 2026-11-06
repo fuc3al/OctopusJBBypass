@@ -1,105 +1,70 @@
-# 04 · `encryptedInfo` 的结构，以及为什么解不开
+# encryptedInfo 与网络观测
 
-## 抓到了什么
+## 请求结构
 
-`POST /ow_owallet_ws/rest/authenticate/encryptedInfo`，`multipart/form-data`，**677 B**。
-把完整 body 落盘后解开（hex → bytes）：
+接口为 `POST /ow_owallet_ws/rest/authenticate/encryptedInfo`，使用 `multipart/form-data`。
+记录中的请求体为 677 B，包含 `appData` 和 `appKey`：
 
-```
+```text
 --alamofire.boundary.xxxxxxxx
 Content-Disposition: form-data; name="appData"; filename="appData"
 Content-Type: application/octet-stream
 
-<二进制：16 B IV + AES-CBC 密文>
+<16 B IV + AES-CBC 密文>
 
 --alamofire.boundary.xxxxxxxx
 Content-Disposition: form-data; name="appKey"; filename="appKey"
 Content-Type: application/octet-stream
 
-<二进制：约 256 B，RSA-2048 密文>
+<约 256 B RSA-2048 密文>
 ```
 
-**两段式信封加密**：
+请求采用信封加密：
 
 | 字段 | 内容 |
 |---|---|
-| `appKey` | 运行时随机生成的 AES 密钥，用服务端 RSA 公钥（OAEP）包裹 |
-| `appData` | 那把一次性密钥做的 AES-CBC 加密，前 16 B 是 IV |
+| `appKey` | 运行时生成的 AES 密钥，经服务端 RSA 公钥加密 |
+| `appData` | 使用该 AES 密钥加密的数据，前 16 B 为 IV |
 
-要还原明文 = 用服务端**私钥**解 `appKey` → 拿 AES key → 解 `appData`。
-两边都不在我们手上，所以**离线解密在密码学上不成立**，不是工具问题。
+离线还原需要对应的 AES 密钥，或用于解开 `appKey` 的 RSA 私钥。目前只拿到了请求密文，未取得明文。
 
-## 为什么所有 C 层钩子都是 0 命中
+## 加密调用
 
-先看这份 App 到底导入了什么（App Store 原包符号表完整，1616 条 chained imports）：
+App 的导入表中包含 `CryptoSwift.AES: Cipher` 的 witness table，没有直接导入 `CCCrypt`、`SecKeyEncrypt` 或 `SecKeyCreateEncryptedData`。
+另外还有 JOSESwift 的验签相关符号和 SwiftyRSA 的公钥相关符号。
 
-```
-CryptoSwift        1 条
-   _$s11CryptoSwift3AESCAA6CipherAAWP        ← 只有 AES: Cipher 的 witness table
-
-CCCrypt            0 条
-SecKeyEncrypt      0 条
-SecKeyCreate…      0 条
-CryptoKit          0 条
-
-JOSESwift          6 条  (JWS / Payload / Verifier —— 验签用)
-SwiftyRSA          3 条  (PublicKey 协议一致性 / Error —— 只用公钥)
-```
-
-也就是说加密调用长这样：
+AES 调用推测通过 `Cipher` 协议派发，形式类似：
 
 ```swift
 let cipher: any Cipher = AES(key: key, blockMode: CBC(iv: iv), padding: .pkcs7)
-try cipher.encrypt(bytes)          // 协议方法，走 witness table 动态派发
+try cipher.encrypt(bytes)
 ```
 
-不走 `Data.encrypt(cipher:)`（未导入），也不走任何 CommonCrypto 符号。
-`CryptoSwift` 的 AES 是**纯 Swift 实现**，所以：
+CryptoSwift 的 AES 使用 Swift 实现。本次符号槽重绑定的结果为：
 
-| 尝试的钩子 | 结果 |
+| 函数 | 结果 |
 |---|---|
-| `CCCrypt`（3 个镜像） | 0 |
-| `CCCryptorCreate` / `CCCryptorUpdate` | 0 |
-| `SecKeyCreateEncryptedData`（3 个镜像） | 0 |
-| `SecKeyEncrypt` | 0 |
-| `getenv`（对照组，验证机制本身） | **有命中** |
+| `CCCrypt` | 未命中 |
+| `CCCryptorCreate` / `CCCryptorUpdate` | 未命中 |
+| `SecKeyCreateEncryptedData` / `SecKeyEncrypt` | 未命中 |
+| `getenv` | 有调用记录，用于检查重绑定是否生效 |
 
-对照组证明符号重绑定是好的 —— 0 命中是因为**这条路径根本不经过 C 符号**。
+目前没有从这些 C 函数入口截取到加密参数。继续分析需要沿 `AES: Cipher` 的 witness table 定位 Swift 实现，并处理对应 ABI；这部分尚未实现。
 
-## 继续下去需要什么
+## 越狱状态与请求变化
 
-唯一可行的是 **inline hook**：
+以下四种状态下，记录到的 `encryptedInfo` 请求体均为 677 B：
 
-1. 从 `AES: Cipher` 的 witness table 里解出 `encrypt` 的内部实现地址（未导出）；
-2. 写 ABI 完全一致的替身（Swift 协议方法：`self` 在 x20、`[UInt8]` 间接返回、`throws` 用 swifterror）；
-3. 在 arm64 上做指令重定位（`adrp/add`、`ldr literal` 都要修）。
+- 绕过生效，未出现检测提示。
+- 检测提示已弹出。
+- 强制登出后重新登录。
+- 再次登录。
 
-成本高且脆弱，本项目**不实现**。
+检测提示出现前后的请求对比中，也没有观察到新增的专用上报请求。
+这些记录能说明请求数量和长度没有变化，密文里的字段仍未确定。
 
-## 一个间接但有力的结论
+另一个已观察到的上报来自 Firebase Analytics：`PromonNoticeViewController` 会作为 `screen_view` 记录，对应 `_vs` 事件。
 
-`encryptedInfo` 的 677 B 在四种状态下长度**完全一致**：
+## 证书固定相关条目
 
-| 场景 | 长度 |
-|---|---|
-| 抑制生效，检测不成立 | 677 |
-| 检测成立并弹窗 | 677 |
-| 强制登出后重新登录 | 677 |
-| 再次登录 | 677 |
-
-长度恒定 + 每次登录只生成一次（缓存复用）→ 它是**设备静态信息**，
-不随越狱判定变化。结合"检测成立时零新增请求"的 A/B 对照，可以确认：
-**这条加密通道里没有越狱状态字段。**
-
-## 顺带发现：证书固定
-
-在 App 进程内用 `SecItemCopyMatching` 枚举它自己的 keychain：
-
-```
-svc=oepay://certPinKeystore  acct=certPinKeystore  len=37609   ← 37 KB 的 pinning keystore
-svc=com.firebase.FIRInstallations.installations  len=450
-svc=BranchKeychainService  acct=BranchKeychainFirstBuild/FirstInstall/Temp  len=223 ×3
-svc=com.octopuscards.octopus  acct=_pfo  len=1
-```
-
-pinning 是开着的 —— 抓包代理没有意义，"进程内、加密前"截取才是可行路径。
+App 的 keychain 中存在 `oepay://certPinKeystore`，大小约 37 KB。当前工具通过进程内 hook 记录请求和加密调用。

@@ -1,116 +1,91 @@
-# 02 · 绕过方案与实测
+# 绕过方案
 
-## 设计依据：拦截是异步、非阻塞的
+## 启动过程
 
-一次冷启动的 syslog 时序（9.54.0 / iOS 16.2）：
+9.54.0 / iOS 16.2 的一次冷启动记录，以 key window 建立为起点：
 
+```text
+ 0 ms     key window 建立
+21 ms     加载启动页文案
+46 ms     加载 PromonNoticeViewController.nib
+          出现 promon.message.exit.type.6 / type.2
+          读取 PromonConfigUpdateTime
+1964 ms   读取 AuthenticationManager.session
+2015 ms   读取 skippedSplash
+约 4 s    加载配置缓存和首页数据
 ```
-13:02:43.986  key window 建立
-13:02:44.007  app.splash.skip.button 文案
-13:02:44.032  PromonNoticeViewController.nib 加载
-              promon.message.exit.type.6
-              promon.message.exit.type.2      ← "已越狱无法使用"
-13:02:44.032  CFPrefs 读 PromonConfigUpdateTime
-13:02:45.950  ← 已经在读 AuthenticationManager.session
-13:02:46.001  读 skippedSplash
-13:02:48+     配置缓存、首页数据 …… 一路跑完
-```
 
-**弹窗 44.0 秒建好，启动流水线一秒都没停，45.9 秒就开始恢复会话。**
-视图事件序列也印证了它会被替换掉：
+提示页出现后，启动流程继续执行。视图切换顺序为：
 
-```
+```text
 SplashScreenViewController → PromonNoticeViewController → ProductTourViewController
 ```
 
-所以有两种绕过策略：
+这解释了提示页有时会一闪而过：后续导航替换了它。绕过方案直接拦截 SHIELD 的结果回调和提示页。
 
-| 策略 | 做法 | 确定性 |
-|---|---|---|
-| 利用竞态 | 什么都不做，等首页接管 | 差（取决于网络与启动速度） |
-| 切断投递 | 让 SHIELD 的判定到不了 App | **确定** |
+## 早期版本
 
----
+[OctopusJBHook.m](../src/OctopusJBHook.m) 同时处理文件检查、环境变量、ObjC 检测方法、SHIELD 回调和 UI：
 
-## 方案演进
+- C 函数：`fopen`、`opendir`、`access`、`stat`、`lstat`、`readlink`、`getenv`、`fork`、`ptrace`、`sysctl`、`_dyld_get_image_name`。
+- ObjC：DTT 和 `JailbreakCheck` 的检测方法，以及文件检查、写入和 URL scheme 检查。
+- SHIELD：observer 注册和 `performSecurityChecks`。
+- UI：过滤 `presentViewController:`、`pushViewController:`、`setRootViewController:` 中的检测提示页。
 
-### v1 全量版 `src/OctopusJBHook.m`
+其中将 `fork()` 固定返回 `-1` 会影响 CFNetwork/TLS。后续版本删掉了 `stat`、`lstat`、`access`、`fork`、`ptrace`、`sysctl` 的 hook，`canOpenURL:` 也只处理越狱相关 scheme。
 
-11 个 hook，什么都管：
+## PromonKiller
 
-- `DYLD_INTERPOSE`：`fopen` `opendir` `access` `stat` `lstat` `readlink` `getenv` `fork` `ptrace` `sysctl` `_dyld_get_image_name`
-- ObjC：`+[DTTJailbreakDetection isJailbroken]`、`+[JailbreakCheck isJailbroken]`、
-  `+[JailbreakCheck jailbreakStatusCode]`、`NSFileManager` 的 `fileExistsAtPath:`(x2)、
-  `NSString writeToFile:…`、`UIApplication canOpenURL:`
-- SHIELD：`PRMShieldEventManager` / `ShieldCallbackManager` 的 `addObserver:`、`performSecurityChecks`、`setObserver:`
-- UI 兜底：`presentViewController:` / `pushViewController:` / `setRootViewController:` 过滤 `Promon*`
+[PromonKiller.m](../src/PromonKiller.m) 保留 3 个方法 hook：
 
-问题：`fork()=-1` 会打断 CFNetwork/TLS；`stat`/`lstat`/`access` 对这三层检测毫无用处，纯增加 ABT 风险。
-
-### v2 精简全量版
-
-删掉 `stat`/`lstat`/`access`/`fork`/`ptrace`/`sysctl`（App、DTT、SHIELD 都不导入这些），
-`canOpenURL:` 改成只否掉越狱 scheme（其余放行原函数），保留
-`fopen`/`opendir`/`readlink`/`getenv` + `_dyld_get_image_name`。
-
-### v3 最小版 `src/PromonKiller.m`（推荐）
-
-只切 3 个方法：
-
-| Hook | 作用 |
+| 方法 | 处理 |
 |---|---|
-| `-[PRMShieldEventManager addObserver:]` | 判定送不到 App 的 Swift 层 |
-| `-[ShieldCallbackManager addObserver:]` | 另一条注册路径 |
-| `-[UIViewController presentViewController:animated:completion:]` | 类名含 `Promon`/`Jailbreak`/`SecurityNotice` 的直接丢弃 |
+| `-[PRMShieldEventManager addObserver:]` | 拦截 observer 注册 |
+| `-[ShieldCallbackManager addObserver:]` | 拦截另一处 observer 注册 |
+| `-[UIViewController presentViewController:animated:completion:]` | 过滤类名包含 `Promon`、`Jailbreak`、`SecurityNotice` 的页面 |
 
-不碰文件、不碰环境变量、不改检测器返回值 —— 暴露给 SHIELD 的 IMP 扫描面从 11 个降到 3 个。
+安装 hook 的逻辑在 constructor 和主队列各执行一次，补上稍后注册的类。
+替换前比较当前 IMP，避免重复安装。
 
-**3/3 冷启动实测：**
+9.54.0 连续三次冷启动均保持运行，日志中未出现 `promon.message.exit` 或 `PromonNoticeViewController`。
+开启调试日志后，可以看到：
 
-```
-run1 alive=1
-run2 alive=1
-run3 alive=1
-promon.message.exit / PromonNoticeViewController 出现次数: 0
-```
-
-日志：
-
-```
-[PromonKiller] loaded pid=…
+```text
 [PromonKiller] hooked -[PRMShieldEventManager addObserver:]
 [PromonKiller] hooked -[ShieldCallbackManager addObserver:]
 [PromonKiller] hooked -presentViewController:animated:completion:
-[PromonKiller] swallowed -addObserver:<AppDelegate: 0x…>
+[PromonKiller] swallowed -addObserver:<AppDelegate: …>
 ```
 
----
+## 安装与卸载
 
-## 投递方式：ellekit，不是 TrollFools
+使用 ellekit 加载 dylib。TrollFools 修改、重签 App Store 原包后的崩溃记录见[注入崩溃分析](03-crash-analysis.md)。
 
-这一点踩过坑，单独记在 `docs/03-crash-analysis.md`：
-
-| 方式 | 是否改 App 二进制 | 是否重签 | 结果 |
-|---|---|---|---|
-| TrollFools 注入 | 是 | 是 | **启动即崩**（FairPlay 失效） |
-| ellekit 注入 | 否 | 否 | 正常，签名校验 17490/17490 页全对 |
-
----
-
-## 安装 / 卸载
+在 macOS 上构建：
 
 ```bash
-export IPHONE_HOST=… IPHONE_USER=mobile IPHONE_PASS=…
-python tools/deploy_tweak.py install --dylib build/libPromonKiller.dylib \
-       --bundle com.octopuscards.octopus
+./scripts/build_mac.sh src/PromonKiller.m libPromonKiller
+```
+
+需要日志时，在构建命令末尾加上 `'-DPROMON_KILLER_DEBUG'`。
+
+```bash
+export IPHONE_HOST='<设备地址>'
+export IPHONE_USER=mobile
+export IPHONE_PASS='<SSH 密码>'
+
+python tools/deploy_tweak.py install \
+    --dylib build/libPromonKiller.dylib \
+    --bundle com.octopuscards.octopus
+
 python tools/deploy_tweak.py remove --name libPromonKiller
 ```
 
-落到设备上的文件：
+安装位置：
 
-```
-/var/jb/usr/lib/TweakInject/libPromonKiller.dylib    root:wheel 755
-/var/jb/usr/lib/TweakInject/libPromonKiller.plist    Filter → com.octopuscards.octopus
+```text
+/var/jb/usr/lib/TweakInject/libPromonKiller.dylib
+/var/jb/usr/lib/TweakInject/libPromonKiller.plist
 ```
 
-不需要 respring：Substrate 兼容的 filter 在每次 exec 时按需加载。
+plist 的 Filter 指定 `com.octopuscards.octopus`。安装或卸载后重新启动 App，无需 respring。

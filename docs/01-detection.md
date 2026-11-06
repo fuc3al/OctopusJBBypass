@@ -1,75 +1,58 @@
-# 01 · 越狱检测的三层结构
+# 越狱检测
 
-目标：`com.octopuscards.octopus` 9.50.0（脱壳样本）/ 9.54.0（App Store 现网）。
-分析手段：Mach-O 解析（chained fixups）+ ObjC 元数据遍历 + Capstone 反汇编 + 运行期验证。
+分析版本：9.50.0（脱壳样本）、9.54.0（App Store）。
+静态分析使用 Mach-O 解析、ObjC 元数据遍历和 Capstone 反汇编，再结合运行日志确认调用过程。
 
----
+## DTTJailbreakDetection
 
-## L1 · DTTJailbreakDetection
+第三方 CocoaPod，入口是 `+[DTTJailbreakDetection isJailbroken]`。
+9.50.0 中的方法偏移为 `0x4000`，依次执行：
 
-第三方 CocoaPod，类 `DTTJailbreakDetection`，类方法 `+isJailbroken`。
+1. 用 `fopen(path, "r")` 检查 `/Applications/Cydia.app`、`/Library/MobileSubstrate/MobileSubstrate.dylib`、`/bin/bash`、`/usr/sbin/sshd`、`/etc/apt`、`/usr/bin/ssh`。
+2. 用 `-[NSFileManager fileExistsAtPath:]` 再检查一次。
+3. 尝试向 `/private/jailbreak.txt` 写入内容，写入成功则判定越狱，随后删除文件。
+4. 用 `-[UIApplication canOpenURL:]` 检查 `cydia://package/com.example.package`。
 
-`+[DTTJailbreakDetection isJailbroken]` @ `0x4000`（9.50.0）的实现顺序：
+## JailbreakCheck
 
-1. 六次 `fopen(path, "r")`，路径分别是
-   `/Applications/Cydia.app`、`/Library/MobileSubstrate/MobileSubstrate.dylib`、
-   `/bin/bash`、`/usr/sbin/sshd`、`/etc/apt`、`/usr/bin/ssh`；
-2. 六次 `-[NSFileManager fileExistsAtPath:]` 复检；
-3. 写文件测试：`[@"." writeToFile:@"/private/jailbreak.txt" atomically:YES
-   encoding:NSUTF8StringEncoding error:&err]` —— **写成功即判定越狱**；
-4. `removeItemAtPath:error:` 清理；
-5. `[NSURL URLWithString:@"cydia://package/com.example.package"]` + `-[UIApplication canOpenURL:]`。
+App 内的 `JailbreakCheck` 继承自 `NSObject`：
 
-## L2 · 自研 JailbreakCheck
+- `+isJailbroken`：调用 `+jailbreakStatusCode`，返回值不为 `nil` 则判定越狱。
+- `+jailbreakStatusCode`：将路径检查、文件写入和 URL scheme 检查的结果编码成由 `1`、`0` 组成的字符串。
 
-`JailbreakCheck`（父类 `NSObject`）：
+检测内容与 DTT 基本相同，多了一层结果编码。
 
-- `+isJailbroken` @ `0x100010c1c` = `([JailbreakCheck jailbreakStatusCode] != nil)`
-- `+jailbreakStatusCode` @ `0x100010c40` 用一个 `NSMutableString` 逐条追加 `@"1"` / `@"0"`，
-  拼成**位串**：路径探测、`/private/jailbreak.txt` 写入测试、`cydia://` 能否打开各占一位。
+## Promon SHIELD
 
-也就是说：它把 L1 那套探针又实现了一遍，结果编码成字符串。
+位于 `Frameworks/octopusx.framework`，bundle ID 为 `no.promon.shield`，字符串经过混淆。
 
-## L3 · Promon SHIELD
-
-`Frameworks/octopusx.framework`（bundle id `no.promon.shield`，9.6 MB，字符串混淆）。
-ObjC 对外暴露：
-
-| 类 / 选择器 | 作用 |
+| 类 / 方法 | 用途 |
 |---|---|
-| `PRMShieldEventManager` `+shared` `-addObserver:` `-performSecurityChecks` | 事件分发；App 注册 observer 接收判定 |
-| `PRMShieldConfig` `+requestUpdate` `+getActiveConfigTimestamp` | 规则配置的每日更新 |
-| `ShieldCallbackManager` `+setObserver:` | 另一条回调注册路径 |
-| `PRMViewProtection` / `PRMLayerCleanupHelper` | 截屏 / 覆盖层检测 |
+| `PRMShieldEventManager`：`+shared`、`-addObserver:`、`-performSecurityChecks` | 执行检查并向 App 分发结果 |
+| `PRMShieldConfig`：`+requestUpdate`、`+getActiveConfigTimestamp` | 更新和读取检测配置 |
+| `ShieldCallbackManager`：`+setObserver:` | 注册回调 |
+| `PRMViewProtection` / `PRMLayerCleanupHelper` | 截屏和覆盖层检测 |
 
-内部导入（说明它自己也在扫）：`_fopen _opendir _readdir _readlink _getenv _dlsym
-_pthread_atfork _pipe _class_copyMethodList _method_getImplementation
-_method_exchangeImplementations`。
+框架导入了 `fopen`、`opendir`、`readdir`、`readlink`、`getenv`、`dlsym` 等函数。
+另外还有 `class_copyMethodList`、`method_getImplementation` 和 `method_exchangeImplementations`，
+可用于检查 ObjC 方法实现，因此绕过版本尽量减少方法替换。
 
-`_class_copyMethodList` + `_method_getImplementation` 意味着它**会枚举方法并比对 IMP**，
-所以 swizzle 数量越少越好（这也是后来做"最小版"的原因）。
+## 检测提示
 
----
+App 中的 `logPromonStatus(_:)` 日志涉及以下状态：
 
-## 判定怎么走到 UI 的
-
-App 侧日志字符串（`logPromonStatus(_:)` 系列）说明了状态包内容：
-
-```
-Promon - Jailbreak detected
-Promon - debuggerStatus:
-Promon - hookingFrameworksDetected
-Promon - libraryInjectionDetected / libraryInjectionPrevented
-Promon - repackagingStatus:
-Promon - configUpdateReceived:
-Promon - Daily Update / First installation Update
-Promon - getActiveConfigTimestamp: / lastUpdateDay:
+```text
+Jailbreak detected
+debuggerStatus
+hookingFrameworksDetected
+libraryInjectionDetected / libraryInjectionPrevented
+repackagingStatus
+configUpdateReceived
+Daily Update / First installation Update
 ```
 
-UI 侧：`_TtC17OctopusQuickBuild26PromonNoticeViewController`
-（`viewDidLoad` @ `0x10111de04`、`didTapExit` @ `0x10111dfa0`），
-文案键 `promon.message.exit.type.%d`，实测存在 `type.2`（越狱）与 `type.6`（不支持的装置），
-按钮键 `promon.exit.button`。
+提示页类名为 `_TtC17OctopusQuickBuild26PromonNoticeViewController`。
+文案键使用 `promon.message.exit.type.%d`，测试中出现了 `type.2`（越狱）和 `type.6`（不支持的装置），按钮键为 `promon.exit.button`。
 
-**关键：这个 VC 只是被 present 出来的普通页面，没有任何"挂起业务"的动作。**
-下一份文档给出完整时序证据。
+9.54.0 的启动日志中，提示页通过 modal 弹出后，App 仍继续恢复会话、加载首页。
+具体时序见[绕过方案](02-bypass.md)。
